@@ -1,0 +1,42 @@
+# Red Hat Errata Monitor -- Filter Configuration
+#
+# Each [section] defines a named filter that the monitor checks on every run.
+# Available keys:
+#
+#   product  = Exact product name as listed by 'list-products' command
+#              Maps to: fq=portal_product_names:("...")
+#
+#   synopsis = Free-text search terms matched against errata synopsis/content
+#              Use quotes for exact phrases: "Satellite 6" "release"
+#              Maps to: q=...
+#
+# Both keys are optional.  If both are set, results must match BOTH (AND logic).
+# If neither is set, all errata are returned (not recommended).
+#
+# Run 'list-products' to discover valid product names:
+#   python3 rh_errata_monitor.py list-products
+#   python3 rh_errata_monitor.py list-products --search satellite
+
+# -- Red Hat Satellite -------------------------------------------------------
+
+[satellite-releases]
+# All errata for the "Red Hat Satellite" product that mention "Satellite 6"
+product = Red Hat Satellite
+synopsis = Satellite 6
+
+[satellite-capsule]
+product = Red Hat Satellite Capsule
+
+# -- Ansible Automation Platform ---------------------------------------------
+
+[aap-setup-bundle]
+# AAP bundled installer release errata
+synopsis = "Ansible Automation Platform" "Setup Bundle"
+
+[aap-containerized-setup]
+# AAP containerized setup release errata
+synopsis = "Ansible Automation Platform" "Containized Setup"
+
+[aap-all]
+# All errata for the AAP product (security, bug fix, enhancement)
+product = Red Hat Ansible Automation Platform
