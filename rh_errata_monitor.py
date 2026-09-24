@@ -118,10 +118,10 @@ examples:
     )
     parser.add_argument(
         "--format",
-        choices=["text", "json", "csv"],
-        default="text",
+        choices=["json", "csv", "md"],
+        default="md",
         dest="output_format",
-        help="Output format (default: text)",
+        help="Output format (default: md)",
     )
     parser.add_argument(
         "--output",
@@ -477,6 +477,39 @@ def fetch_products(search: str = "") -> list[tuple[str, int]]:
     return products
 
 
+def _validate_products(products: list[str]) -> None:
+    """Validate that every non-empty product name is a known product.
+
+    Fetches the current product list from the API once and checks all given
+    names against it (exact match).  Exits with an error listing any unknown
+    names.  Besides catching typos early, this also guards against Solr
+    query injection: since only names taken verbatim from the API's own
+    facets are accepted, arbitrary quote/operator payloads in a `product`
+    value can never reach the query unescaped.
+
+    If the product list cannot be fetched (e.g. API unreachable), validation
+    is skipped with a warning rather than blocking the run.
+    """
+    names = {p for p in products if p}
+    if not names:
+        return
+
+    known = {name for name, _ in fetch_products()}
+    if not known:
+        log.warning(
+            "Could not fetch product list to validate names; proceeding without validation"
+        )
+        return
+
+    unknown = sorted(n for n in names if n not in known)
+    if unknown:
+        log.error(
+            "Unknown product name(s): %s (run 'list-products' to see valid names)",
+            ", ".join(repr(n) for n in unknown),
+        )
+        sys.exit(1)
+
+
 # ---------------------------------------------------------------------------
 # Formatters
 # ---------------------------------------------------------------------------
@@ -494,54 +527,6 @@ def _errata_row(doc: dict) -> dict:
         "products": ", ".join(doc.get("portal_product_names", [])),
         "url": doc.get("view_uri", ERRATA_URL_TEMPLATE.format(errata_id=errata_id)),
     }
-
-
-def format_report(results: dict[str, list[dict]]) -> str:
-    """Text report grouped by filter name."""
-    lines: list[str] = []
-    total = 0
-
-    for name, docs in results.items():
-        count = len(docs)
-        total += count
-        lines.append(f"=== {name} ({count} new errat{'um' if count == 1 else 'a'}) ===")
-
-        if not docs:
-            lines.append("  (none)")
-        else:
-            for doc in docs:
-                r = _errata_row(doc)
-                lines.append(
-                    f"  {r['id']:<22s} {r['type']:<30s} {r['severity']:<12s} "
-                    f"{r['date']}  {r['synopsis']}"
-                )
-                lines.append(f"  {'':22s} {r['url']}")
-
-        lines.append("")
-
-    filter_count = sum(1 for docs in results.values() if docs)
-    lines.append(
-        f"Total: {total} new errat{'um' if total == 1 else 'a'} "
-        f"across {filter_count} filter{'s' if filter_count != 1 else ''}"
-    )
-    return "\n".join(lines)
-
-
-def format_report_flat(docs: list[dict]) -> str:
-    """Text report for a flat (non-grouped) list of errata."""
-    lines: list[str] = []
-
-    for doc in docs:
-        r = _errata_row(doc)
-        lines.append(
-            f"{r['id']:<22s} {r['type']:<30s} {r['severity']:<12s} "
-            f"{r['date']}  {r['synopsis']}"
-        )
-        lines.append(f"{'':22s} {r['url']}")
-
-    lines.append("")
-    lines.append(f"Total: {len(docs)} errat{'um' if len(docs) == 1 else 'a'}")
-    return "\n".join(lines)
 
 
 def format_json(results: dict[str, list[dict]] | list[dict]) -> str:
@@ -580,6 +565,73 @@ def format_csv(results: dict[str, list[dict]] | list[dict]) -> str:
     return buf.getvalue()
 
 
+def format_report_md(
+    results: dict[str, list[dict]],
+    since_date: str = "",
+    new: bool = True,
+) -> str:
+    """Markdown report grouped by filter name.
+
+    One "### filter-name (...)" section per filter, followed by a bullet
+    list of markdown links (or "- none" when empty).  When *since_date* is
+    given, both the per-filter headers and the final total line include a
+    "since {since_date}" suffix.  *new* controls whether the wording says
+    "new errata" (monitor) or plain "errata" (stateless filtered search).
+    """
+    lines: list[str] = []
+    total = 0
+    label = "new errat" if new else "errat"
+    since_suffix = f" since {since_date}" if since_date else ""
+
+    for name, docs in results.items():
+        count = len(docs)
+        total += count
+        unit = "um" if count == 1 else "a"
+        lines.append(f"### {name} ({count} {label}{unit}{since_suffix})")
+        lines.append("")
+
+        if not docs:
+            lines.append("  - none")
+        else:
+            for doc in docs:
+                r = _errata_row(doc)
+                lines.append(f"  - [{r['id']} - {r['synopsis']}]({r['url']}) - {r['severity']}")
+
+        lines.append("")
+
+    filter_count = sum(1 for docs in results.values() if docs)
+    total_unit = "um" if total == 1 else "a"
+    lines.append(
+        f"**Total: {total} {label}{total_unit}{since_suffix} "
+        f"across {filter_count} filter{'s' if filter_count != 1 else ''}**"
+    )
+    return "\n".join(lines)
+
+
+def format_report_flat_md(docs: list[dict], since_date: str = "") -> str:
+    """Markdown report for a flat (non-grouped) list of errata.
+
+    Plain bullet list of markdown links (no "###" headers), followed by a
+    bold total line.  When *since_date* is given, the total line includes a
+    "since {since_date}" suffix.
+    """
+    lines: list[str] = []
+    since_suffix = f" since {since_date}" if since_date else ""
+
+    if not docs:
+        lines.append("  - none")
+    else:
+        for doc in docs:
+            r = _errata_row(doc)
+            lines.append(f"  - [{r['id']} - {r['synopsis']}]({r['url']}) - {r['severity']}")
+
+    lines.append("")
+    lines.append(
+        f"**Total: {len(docs)} errat{'um' if len(docs) == 1 else 'a'}{since_suffix}**"
+    )
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -591,11 +643,13 @@ def cmd_monitor(args: argparse.Namespace) -> None:
         args.filters = "filters.conf"
 
     # Handle reset
-    if hasattr(args, "reset_filters") and args.reset_filters:
-        if args.reset_after and not args.reset_filters:
-            log.error("--reset-after requires --reset-filters")
-            sys.exit(1)
-        _reset_state(args.state_file, args.reset_filters, getattr(args, "reset_after", None))
+    reset_filters = getattr(args, "reset_filters", None)
+    reset_after = getattr(args, "reset_after", None)
+    if reset_after and not reset_filters:
+        log.error("--reset-after requires --reset-filters")
+        sys.exit(1)
+    if reset_filters:
+        _reset_state(args.state_file, reset_filters, reset_after)
         return
 
     filters = load_filters(args.filters)
@@ -614,6 +668,8 @@ def cmd_monitor(args: argparse.Namespace) -> None:
                 print(f"    product: {product}")
             print(f"    after:   {after_date}")
         return
+
+    _validate_products([filt.get("product", "") for filt in filters.values()])
 
     log.debug("Querying errata published after %s for %d filter(s)", after_date, len(filters))
 
@@ -646,7 +702,11 @@ def cmd_monitor(args: argparse.Namespace) -> None:
             time.sleep(REQUEST_DELAY)
 
     # Format output
-    formatters = {"text": format_report, "json": format_json, "csv": format_csv}
+    formatters = {
+        "json": format_json,
+        "csv": format_csv,
+        "md": lambda r: format_report_md(r, since_date=after_date, new=True),
+    }
     report = formatters[args.output_format](results)
     print(report)
 
@@ -693,15 +753,13 @@ def cmd_list_products(args: argparse.Namespace) -> None:
         for name, count in products:
             writer.writerow([name, count])
         output = buf.getvalue()
-    else:
+    else:  # md
         lines = []
-        max_name = min(max(len(name) for name, _ in products), 60)
         for name, count in products:
-            lines.append(f"  {name:<{max_name}s}  ({count} errata)")
+            lines.append(f"  - {name} ({count} errata)")
         lines.append("")
-        lines.append(f"Total: {len(products)} products")
-        if search:
-            lines.append(f'(filtered by: "{search}")')
+        filtered_suffix = f' (filtered by: "{search}")' if search else ""
+        lines.append(f"**Total: {len(products)} products{filtered_suffix}**")
         output = "\n".join(lines)
 
     print(output)
@@ -764,6 +822,8 @@ def _cmd_search_flat(
         print(f"  rows:     {rows}")
         return
 
+    _validate_products([product])
+
     docs, success = fetch_errata(
         query=q,
         product=product,
@@ -778,9 +838,9 @@ def _cmd_search_flat(
         sys.exit(1)
 
     formatters_flat = {
-        "text": format_report_flat,
         "json": lambda d: format_json(d),
         "csv": lambda d: format_csv(d),
+        "md": lambda d: format_report_flat_md(d, since_date=after),
     }
     report = formatters_flat[args.output_format](docs)
     print(report)
@@ -818,6 +878,8 @@ def _cmd_search_filters(
             print(f"    rows:    {rows}")
         return
 
+    _validate_products([filt.get("product", "") for filt in filters.values()])
+
     results: dict[str, list[dict]] = {}
     for i, (name, filt) in enumerate(filters.items()):
         q = filt.get("synopsis") or "*:*"
@@ -839,7 +901,11 @@ def _cmd_search_filters(
         if i < len(filters) - 1:
             time.sleep(REQUEST_DELAY)
 
-    formatters = {"text": format_report, "json": format_json, "csv": format_csv}
+    formatters = {
+        "json": format_json,
+        "csv": format_csv,
+        "md": lambda r: format_report_md(r, since_date=after, new=False),
+    }
     report = formatters[args.output_format](results)
     print(report)
 

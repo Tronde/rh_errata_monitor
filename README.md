@@ -76,19 +76,22 @@ On the first run it looks back 30 days by default. Subsequent runs only show err
 
 ### Example output
 
-```
-=== satellite-releases (2 new errata) ===
-  RHBA-2026:51087        Bug Fix Advisory              None         2026-08-06  Satellite 6 Client Bug Fix Update
-                         https://access.redhat.com/errata/RHBA-2026:51087
-  RHSA-2024:2010         Security Advisory             Important    2024-04-23  Important: Satellite 6.15.0 release
-                         https://access.redhat.com/errata/RHSA-2024:2010
+The default format is `md` (Markdown), which is convenient for pasting into wiki pages, PR comments, or chat:
 
-=== aap-setup-bundle (1 new erratum) ===
-  RHBA-2026:67611        Bug Fix Advisory              None         2026-09-15  Red Hat Ansible Automation Platform 2.7 Setup Bundle Release Update
-                         https://access.redhat.com/errata/RHBA-2026:67611
+```markdown
+### satellite-releases (2 new errata since 2026-08-20)
 
-Total: 3 new errata across 2 filters
+  - [RHBA-2026:51087 - Satellite 6 Client Bug Fix Update](https://access.redhat.com/errata/RHBA-2026:51087) - None
+  - [RHSA-2024:2010 - Important: Satellite 6.15.0 release](https://access.redhat.com/errata/RHSA-2024:2010) - Important
+
+### aap-setup-bundle (1 new erratum since 2026-08-20)
+
+  - [RHBA-2026:67611 - Red Hat Ansible Automation Platform 2.7 Setup Bundle Release Update](https://access.redhat.com/errata/RHBA-2026:67611) - None
+
+**Total: 3 new errata since 2026-08-20 across 2 filters**
 ```
+
+The `since DATE` suffix always appears for `monitor` (it always queries from a known date) and only appears for `search` when `--after` was explicitly passed. Filters with no results render as a single `  - none` line.
 
 ## Filter configuration
 
@@ -134,7 +137,7 @@ Both tools share the same interface.
 | `--filters FILE` | Path to INI filter config | `filters.conf` |
 | `--state-file FILE` | Path to JSON state file | `.errata_state.json` |
 | `--initial-days N` | On first run, look back N days | `30` |
-| `--format {text,json,csv}` | Output format | `text` |
+| `--format {json,csv,md}` | Output format | `md` |
 | `--output FILE` | Write report to file in addition to stdout | _(none)_ |
 | `--exit-code` | Exit with code 2 when new errata are found | _(off)_ |
 | `--dry-run` | Show queries without hitting the API | _(off)_ |
@@ -181,6 +184,9 @@ python3 rh_errata_monitor.py --format json monitor
 
 # Generate CSV report to file
 ./rh_errata_monitor.sh --format csv --output /tmp/errata.csv monitor
+
+# Generate a Markdown report (e.g. to paste into a wiki page or PR comment)
+python3 rh_errata_monitor.py --format md monitor
 
 # Reset a specific filter and re-check from a date
 python3 rh_errata_monitor.py monitor --reset-filters satellite-releases --reset-after 2024-01-01

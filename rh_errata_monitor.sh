@@ -35,7 +35,7 @@ FILTERS_FILE="filters.conf"
 FILTERS_EXPLICIT=false
 STATE_FILE=".errata_state.json"
 INITIAL_DAYS=30
-OUTPUT_FORMAT="text"
+OUTPUT_FORMAT="md"
 OUTPUT_FILE=""
 EXIT_CODE_MODE=false
 DRY_RUN=false
@@ -127,6 +127,102 @@ solr_escape() {
     val="${val//&&/\\&\\&}"
     val="${val//||/\\|\\|}"
     printf '%s' "$val"
+}
+
+# ---------------------------------------------------------------------------
+# Validation helpers
+# ---------------------------------------------------------------------------
+
+validate_date() {
+    # Validate that $2 (a date string) matches YYYY-MM-DD. $1 is the flag
+    # name, used only for the error message.
+    local flag="$1"
+    local value="$2"
+    if [[ ! "$value" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+        log_error "Invalid date format for $flag: '$value' (expected YYYY-MM-DD)"
+        exit 1
+    fi
+}
+
+validate_output_format() {
+    # Validate $OUTPUT_FORMAT against the supported set. Unlike Python's
+    # argparse `choices`, bash has no built-in enforcement, so without this
+    # an invalid/removed value (e.g. the old "text" format) would silently
+    # fall through every case statement and produce blank output instead of
+    # a clear error.
+    case "$OUTPUT_FORMAT" in
+        json|csv|md) ;;
+        *)
+            log_error "Invalid --format: '$OUTPUT_FORMAT' (expected: json, csv, md)"
+            exit 1
+            ;;
+    esac
+}
+
+fetch_valid_product_names() {
+    # Returns a JSON array of all known product names (no counts), used to
+    # validate user-supplied --product / filters.conf product values.
+    # Returns "[]" on failure.
+    local url="${API_URL}?"
+    url+="q=$(urlencode '*:*')"
+    url+="&start=0&rows=0"
+    url+="&fq=$(urlencode 'documentKind:("Errata")')"
+    url+="&facet=true"
+    url+="&facet.field=portal_product_names"
+    url+="&facet.mincount=1"
+    url+="&facet.limit=1000"
+
+    local body
+    if ! body=$(api_get "$url"); then
+        echo "[]"
+        return 1
+    fi
+
+    echo "$body" | jq '[(.facet_counts.facet_fields.portal_product_names // []) as $arr | range(0; $arr|length; 2) as $i | $arr[$i]]'
+    return 0
+}
+
+validate_products() {
+    # Validate that every non-empty product name given as an argument is a
+    # known product. Fetches the current product list once and checks all
+    # given names against it (exact match). Exits with an error listing any
+    # unknown names.  Besides catching typos early, this also guards against
+    # Solr query injection: since only names taken verbatim from the API's
+    # own facets are accepted, arbitrary quote/operator payloads in a
+    # `product` value can never reach the query unescaped.
+    #
+    # If the product list cannot be fetched (e.g. API unreachable),
+    # validation is skipped with a warning rather than blocking the run.
+    local -a to_check=()
+    local p
+    for p in "$@"; do
+        [[ -n "$p" ]] && to_check+=("$p")
+    done
+    [[ ${#to_check[@]} -eq 0 ]] && return 0
+
+    local known
+    known=$(fetch_valid_product_names)
+    local known_count
+    known_count=$(echo "$known" | jq 'length')
+    if [[ "$known_count" -eq 0 ]]; then
+        log_warn "Could not fetch product list to validate names; proceeding without validation"
+        return 0
+    fi
+
+    local -a unknown=()
+    for p in "${to_check[@]}"; do
+        if ! echo "$known" | jq -e --arg p "$p" 'index($p) != null' >/dev/null 2>&1; then
+            unknown+=("$p")
+        fi
+    done
+
+    if [[ ${#unknown[@]} -gt 0 ]]; then
+        local joined
+        joined=$(printf '"%s", ' "${unknown[@]}")
+        joined="${joined%, }"
+        log_error "Unknown product name(s): ${joined} (run 'list-products' to see valid names)"
+        exit 1
+    fi
 }
 
 build_url() {
@@ -352,22 +448,6 @@ get_after_date() {
 # Formatters
 # ---------------------------------------------------------------------------
 
-format_errata_text() {
-    local docs_json="$1"
-    local filter_name="${2:-}"
-
-    echo "$docs_json" | jq -r --arg name "$filter_name" '
-        .[] | [
-            .id // "N/A",
-            (.portal_advisory_type // "N/A"),
-            (.portal_severity // "None"),
-            ((.portal_publication_date // "N/A") | .[:10]),
-            (.portal_synopsis // "N/A"),
-            (.view_uri // "N/A")
-        ] | "  \(.[0] | . + " " * (22 - length)) \(.[1] | . + " " * (30 - length)) \(.[2] | . + " " * (12 - length)) \(.[3])  \(.[4])\n  \(" " * 22) \(.[5])"
-    '
-}
-
 format_errata_json() {
     local docs_json="$1"
     local filter_name="${2:-}"
@@ -428,6 +508,17 @@ format_errata_csv_rows() {
     fi
 }
 
+format_errata_md() {
+    # Markdown bullet rows (indented 2 spaces): "  - [id - synopsis](url) - severity"
+    # filter_name is accepted (unused) for signature symmetry with the
+    # other format_errata_* helpers.
+    local docs_json="$1"
+
+    echo "$docs_json" | jq -r '
+        .[] | "  - [\(.id // "N/A") - \(.portal_synopsis // "N/A")](\(.view_uri // "N/A")) - \(.portal_severity // "None")"
+    '
+}
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -451,13 +542,25 @@ cmd_monitor() {
                 reset_after="${1:-}"
                 shift
                 ;;
-            *) shift ;;
+            *)
+                log_error "Unknown monitor flag: $1"
+                usage
+                exit 1
+                ;;
         esac
     done
 
+    if [[ -n "$reset_after" ]]; then
+        validate_date "--reset-after" "$reset_after"
+        if [[ ${#reset_filters[@]} -eq 0 ]]; then
+            log_error "--reset-after requires --reset-filters"
+            exit 1
+        fi
+    fi
+
     # Handle reset
     if [[ ${#reset_filters[@]} -gt 0 ]]; then
-        _reset_state "${reset_filters[@]}" "$reset_after"
+        _reset_state "$reset_after" "${reset_filters[@]}"
         return
     fi
 
@@ -482,6 +585,8 @@ cmd_monitor() {
         return
     fi
 
+    validate_products "${FILTER_PRODUCT[@]}"
+
     log_debug "Querying errata published after $after_date for ${#FILTER_NAMES[@]} filter(s)"
 
     local all_json_results="[]"
@@ -490,7 +595,7 @@ cmd_monitor() {
     local filters_with_new=0
     local output=""
 
-    # Text header / CSV header
+    # CSV header
     if [[ "$OUTPUT_FORMAT" == "csv" ]]; then
         output=$(format_errata_csv_header true)
         output+=$'\n'
@@ -531,22 +636,6 @@ cmd_monitor() {
 
         # Format per filter
         case "$OUTPUT_FORMAT" in
-            text)
-                output+="=== ${name} (${new_count} new errat"
-                if [[ "$new_count" -eq 1 ]]; then
-                    output+="um"
-                else
-                    output+="a"
-                fi
-                output+=") ==="$'\n'
-                if [[ "$new_count" -eq 0 ]]; then
-                    output+="  (none)"$'\n'
-                else
-                    output+=$(format_errata_text "$new_docs" "$name")
-                    output+=$'\n'
-                fi
-                output+=$'\n'
-                ;;
             json)
                 local json_chunk
                 json_chunk=$(format_errata_json "$new_docs" "$name")
@@ -557,6 +646,23 @@ cmd_monitor() {
                     output+=$(format_errata_csv_rows "$new_docs" "$name")
                     output+=$'\n'
                 fi
+                ;;
+            md)
+                output+="### ${name} (${new_count} new errat"
+                if [[ "$new_count" -eq 1 ]]; then
+                    output+="um"
+                else
+                    output+="a"
+                fi
+                output+=" since ${after_date})"$'\n'
+                output+=$'\n'
+                if [[ "$new_count" -eq 0 ]]; then
+                    output+="  - none"$'\n'
+                else
+                    output+=$(format_errata_md "$new_docs" "$name")
+                    output+=$'\n'
+                fi
+                output+=$'\n'
                 ;;
         esac
 
@@ -576,31 +682,32 @@ cmd_monitor() {
 
     # Final output
     case "$OUTPUT_FORMAT" in
-        text)
-            output+="Total: ${total_new} new errat"
-            if [[ "$total_new" -eq 1 ]]; then
-                output+="um"
-            else
-                output+="a"
-            fi
-            output+=" across ${filters_with_new} filter"
-            [[ "$filters_with_new" -ne 1 ]] && output+="s"
-            echo "$output"
-            ;;
         json)
             echo "$all_json_results" | jq '.'
             ;;
         csv)
             echo -n "$output"
             ;;
+        md)
+            output+="**Total: ${total_new} new errat"
+            if [[ "$total_new" -eq 1 ]]; then
+                output+="um"
+            else
+                output+="a"
+            fi
+            output+=" since ${after_date} across ${filters_with_new} filter"
+            [[ "$filters_with_new" -ne 1 ]] && output+="s"
+            output+="**"
+            echo "$output"
+            ;;
     esac
 
     # Write to file
     if [[ -n "$OUTPUT_FILE" ]]; then
         case "$OUTPUT_FORMAT" in
-            text) echo "$output" > "$OUTPUT_FILE" ;;
             json) echo "$all_json_results" | jq '.' > "$OUTPUT_FILE" ;;
             csv)  echo -n "$output" > "$OUTPUT_FILE" ;;
+            md)   echo "$output" > "$OUTPUT_FILE" ;;
         esac
         echo "Report written to $OUTPUT_FILE"
     fi
@@ -629,7 +736,11 @@ cmd_list_products() {
                 search="${1:-}"
                 shift
                 ;;
-            *) shift ;;
+            *)
+                log_error "Unknown list-products flag: $1"
+                usage
+                exit 1
+                ;;
         esac
     done
 
@@ -678,14 +789,6 @@ cmd_list_products() {
     fi
 
     case "$OUTPUT_FORMAT" in
-        text)
-            echo "$products_list" | jq -r '.[] | "  \(.name)  (\(.count) errata)"'
-            echo ""
-            echo "Total: ${count} products"
-            if [[ -n "$search" ]]; then
-                echo "(filtered by: \"$search\")"
-            fi
-            ;;
         json)
             echo "$products_list" | jq '[.[] | {product: .name, errata_count: .count}]'
             ;;
@@ -693,22 +796,31 @@ cmd_list_products() {
             echo "product,errata_count"
             echo "$products_list" | jq -r '.[] | [.name, .count] | @csv'
             ;;
+        md)
+            echo "$products_list" | jq -r '.[] | "  - \(.name) (\(.count) errata)"'
+            echo ""
+            if [[ -n "$search" ]]; then
+                echo "**Total: ${count} products (filtered by: \"$search\")**"
+            else
+                echo "**Total: ${count} products**"
+            fi
+            ;;
     esac
 
     if [[ -n "$OUTPUT_FILE" ]]; then
         case "$OUTPUT_FORMAT" in
-            text)
-                {
-                    echo "$products_list" | jq -r '.[] | "  \(.name)  (\(.count) errata)"'
-                    echo ""
-                    echo "Total: ${count} products"
-                } > "$OUTPUT_FILE"
-                ;;
             json) echo "$products_list" | jq '[.[] | {product: .name, errata_count: .count}]' > "$OUTPUT_FILE" ;;
             csv)
                 {
                     echo "product,errata_count"
                     echo "$products_list" | jq -r '.[] | [.name, .count] | @csv'
+                } > "$OUTPUT_FILE"
+                ;;
+            md)
+                {
+                    echo "$products_list" | jq -r '.[] | "  - \(.name) (\(.count) errata)"'
+                    echo ""
+                    echo "**Total: ${count} products**"
                 } > "$OUTPUT_FILE"
                 ;;
         esac
@@ -729,9 +841,17 @@ cmd_search() {
             --type)       shift; advisory_type="${1:-}"; shift ;;
             --severity)   shift; severity="${1:-}"; shift ;;
             --rows)       shift; rows="${1:-50}"; shift ;;
-            *) shift ;;
+            *)
+                log_error "Unknown search flag: $1"
+                usage
+                exit 1
+                ;;
         esac
     done
+
+    if [[ -n "$after" ]]; then
+        validate_date "--after" "$after"
+    fi
 
     if $FILTERS_EXPLICIT; then
         if [[ ! -f "$FILTERS_FILE" ]]; then
@@ -760,6 +880,8 @@ _cmd_search_flat() {
         return
     fi
 
+    validate_products "$product"
+
     local docs
     if ! docs=$(fetch_errata "$q" "$product" "$after" "$advisory_type" "$severity" "$rows"); then
         local doc_count
@@ -774,13 +896,6 @@ _cmd_search_flat() {
     doc_count=$(echo "$docs" | jq 'length')
 
     case "$OUTPUT_FORMAT" in
-        text)
-            if [[ "$doc_count" -gt 0 ]]; then
-                format_errata_text "$docs"
-            fi
-            echo ""
-            echo "Total: ${doc_count} errat$([ "$doc_count" -eq 1 ] && echo "um" || echo "a")"
-            ;;
         json)
             format_errata_json "$docs"
             ;;
@@ -790,22 +905,41 @@ _cmd_search_flat() {
                 format_errata_csv_rows "$docs"
             fi
             ;;
+        md)
+            if [[ "$doc_count" -gt 0 ]]; then
+                format_errata_md "$docs"
+            else
+                echo "  - none"
+            fi
+            echo ""
+            echo -n "**Total: ${doc_count} errat$([ "$doc_count" -eq 1 ] && echo "um" || echo "a")"
+            [[ -n "$after" ]] && echo -n " since ${after}"
+            echo "**"
+            ;;
     esac
 
     if [[ -n "$OUTPUT_FILE" ]]; then
         case "$OUTPUT_FORMAT" in
-            text)
-                {
-                    [[ "$doc_count" -gt 0 ]] && format_errata_text "$docs"
-                    echo ""
-                    echo "Total: ${doc_count} errata"
-                } > "$OUTPUT_FILE"
-                ;;
             json) format_errata_json "$docs" > "$OUTPUT_FILE" ;;
             csv)
                 {
                     format_errata_csv_header false
                     [[ "$doc_count" -gt 0 ]] && format_errata_csv_rows "$docs"
+                } > "$OUTPUT_FILE"
+                ;;
+            md)
+                {
+                    if [[ "$doc_count" -gt 0 ]]; then
+                        format_errata_md "$docs"
+                    else
+                        echo "  - none"
+                    fi
+                    echo ""
+                    if [[ -n "$after" ]]; then
+                        echo "**Total: ${doc_count} errat$([ "$doc_count" -eq 1 ] && echo "um" || echo "a") since ${after}**"
+                    else
+                        echo "**Total: ${doc_count} errat$([ "$doc_count" -eq 1 ] && echo "um" || echo "a")**"
+                    fi
                 } > "$OUTPUT_FILE"
                 ;;
         esac
@@ -834,6 +968,8 @@ _cmd_search_filters() {
         done
         return
     fi
+
+    validate_products "${FILTER_PRODUCT[@]}"
 
     local all_json_results="[]"
     local total=0
@@ -864,22 +1000,6 @@ _cmd_search_filters() {
         [[ "$doc_count" -gt 0 ]] && filters_with_results=$((filters_with_results + 1))
 
         case "$OUTPUT_FORMAT" in
-            text)
-                output+="=== ${name} (${doc_count} errat"
-                if [[ "$doc_count" -eq 1 ]]; then
-                    output+="um"
-                else
-                    output+="a"
-                fi
-                output+=") ==="$'\n'
-                if [[ "$doc_count" -eq 0 ]]; then
-                    output+="  (none)"$'\n'
-                else
-                    output+=$(format_errata_text "$docs" "$name")
-                    output+=$'\n'
-                fi
-                output+=$'\n'
-                ;;
             json)
                 local json_chunk
                 json_chunk=$(format_errata_json "$docs" "$name")
@@ -891,6 +1011,24 @@ _cmd_search_filters() {
                     output+=$'\n'
                 fi
                 ;;
+            md)
+                output+="### ${name} (${doc_count} errat"
+                if [[ "$doc_count" -eq 1 ]]; then
+                    output+="um"
+                else
+                    output+="a"
+                fi
+                [[ -n "$after" ]] && output+=" since ${after}"
+                output+=")"$'\n'
+                output+=$'\n'
+                if [[ "$doc_count" -eq 0 ]]; then
+                    output+="  - none"$'\n'
+                else
+                    output+=$(format_errata_md "$docs" "$name")
+                    output+=$'\n'
+                fi
+                output+=$'\n'
+                ;;
         esac
 
         if [[ $i -lt $((${#FILTER_NAMES[@]} - 1)) ]]; then
@@ -899,49 +1037,48 @@ _cmd_search_filters() {
     done
 
     case "$OUTPUT_FORMAT" in
-        text)
-            output+="Total: ${total} errat"
-            if [[ "$total" -eq 1 ]]; then
-                output+="um"
-            else
-                output+="a"
-            fi
-            output+=" across ${filters_with_results} filter"
-            [[ "$filters_with_results" -ne 1 ]] && output+="s"
-            echo "$output"
-            ;;
         json)
             echo "$all_json_results" | jq '.'
             ;;
         csv)
             echo -n "$output"
             ;;
+        md)
+            output+="**Total: ${total} errat"
+            if [[ "$total" -eq 1 ]]; then
+                output+="um"
+            else
+                output+="a"
+            fi
+            [[ -n "$after" ]] && output+=" since ${after}"
+            output+=" across ${filters_with_results} filter"
+            [[ "$filters_with_results" -ne 1 ]] && output+="s"
+            output+="**"
+            echo "$output"
+            ;;
     esac
 
     if [[ -n "$OUTPUT_FILE" ]]; then
         case "$OUTPUT_FORMAT" in
-            text) echo "$output" > "$OUTPUT_FILE" ;;
             json) echo "$all_json_results" | jq '.' > "$OUTPUT_FILE" ;;
             csv)  echo -n "$output" > "$OUTPUT_FILE" ;;
+            md)   echo "$output" > "$OUTPUT_FILE" ;;
         esac
         echo "Report written to $OUTPUT_FILE"
     fi
 }
 
 _reset_state() {
+    # Args: <reset_after (may be empty string)> <filter_name>...
+    # reset_after is passed explicitly (rather than sniffed by regex from a
+    # flat argument list) so a filter named like a date can never be
+    # misinterpreted as the --reset-after value.
+    local reset_after="$1"
+    shift
+    local filter_names=("$@")
+
     local state
     state=$(load_state)
-
-    local reset_after=""
-    local filter_names=()
-
-    for arg in "$@"; do
-        if [[ "$arg" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
-            reset_after="$arg"
-        elif [[ -n "$arg" ]]; then
-            filter_names+=("$arg")
-        fi
-    done
 
     if [[ ${#filter_names[@]} -eq 0 ]]; then
         return
@@ -995,7 +1132,7 @@ Global flags:
   --filters FILE       Path to INI filter config (default: filters.conf)
   --state-file FILE    Path to JSON state file (default: .errata_state.json)
   --initial-days N     Lookback days on first run (default: 30)
-  --format FORMAT      Output: text, json, csv (default: text)
+  --format FORMAT      Output: json, csv, md (default: md)
   --output FILE        Write report to file
   --exit-code          Exit 2 when new errata found
   --dry-run            Show queries without hitting API
@@ -1036,7 +1173,7 @@ main() {
             --filters)       shift; FILTERS_FILE="${1:-filters.conf}"; FILTERS_EXPLICIT=true; shift ;;
             --state-file)    shift; STATE_FILE="${1:-.errata_state.json}"; shift ;;
             --initial-days)  shift; INITIAL_DAYS="${1:-30}"; shift ;;
-            --format)        shift; OUTPUT_FORMAT="${1:-text}"; shift ;;
+            --format)        shift; OUTPUT_FORMAT="${1:-md}"; shift ;;
             --output)        shift; OUTPUT_FILE="${1:-}"; shift ;;
             --exit-code)     EXIT_CODE_MODE=true; shift ;;
             --dry-run)       DRY_RUN=true; shift ;;
@@ -1055,6 +1192,8 @@ main() {
                 ;;
         esac
     done
+
+    validate_output_format
 
     command="${command:-monitor}"
 

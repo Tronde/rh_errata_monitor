@@ -1,1 +1,4 @@
 filters.conf
+.errata_state.json
+__pycache__/
+*.pyc
