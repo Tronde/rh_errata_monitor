@@ -1,4 +1,4 @@
-# Red Hat Errata Monitor
+# Unofficial Red Hat Errata Monitor
 
 > **Disclaimer:** This is an independent, community project. It is **not** official
 > software supported by, endorsed by, or affiliated with Red Hat, Inc. It is
