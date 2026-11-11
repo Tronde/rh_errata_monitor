@@ -26,11 +26,14 @@ import json
 import logging
 import sys
 import time
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -39,10 +42,20 @@ import requests
 API_URL = "https://access.redhat.com/hydra/rest/search/kcs"
 ERRATA_URL_TEMPLATE = "https://access.redhat.com/errata/{errata_id}"
 ROWS_PER_PAGE = 500
-MAX_RETRIES = 1
-RETRY_DELAY = 3
-REQUEST_DELAY = 0.5
-USER_AGENT = "rh-errata-monitor/1.0"
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", 1))
+TIMEOUT = int(os.environ.get("TIMEOUT", 15))
+RETRY_DELAY = int(os.environ.get("RETRY_DELAY", 3))
+REQUEST_DELAY = float(os.environ.get("REQUEST_DELAY", 0.5))
+USER_AGENT = os.environ.get("USER_AGENT", "rh-errata-monitor/1.0")
+
+retry_strategy = Retry(
+    total=MAX_RETRIES,
+    backoff_factor=RETRY_DELAY,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["HEAD", "GET", "OPTIONS"],
+)
+adapter = HTTPAdapter(max_retries=retry_strategy)
+
 
 FIELD_LIST = (
     "id,portal_severity,portal_advisory_type,portal_product_names,"
@@ -67,6 +80,9 @@ log = logging.getLogger(__name__)
 
 SESSION = requests.Session()
 SESSION.headers["User-Agent"] = USER_AGENT
+SESSION.mount("https://", adapter)
+SESSION.mount("http://", adapter)
+
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -138,7 +154,8 @@ examples:
         help="Show queries without hitting the API",
     )
     parser.add_argument(
-        "--verbose", "-v",
+        "--verbose",
+        "-v",
         action="store_true",
         help="Enable debug logging",
     )
@@ -161,9 +178,12 @@ examples:
     )
 
     # -- list-products -------------------------------------------------------
-    lp = sub.add_parser("list-products", help="List available product names from the API")
+    lp = sub.add_parser(
+        "list-products", help="List available product names from the API"
+    )
     lp.add_argument(
-        "--search", "-s",
+        "--search",
+        "-s",
         default="",
         help="Filter product names containing this text (case-insensitive)",
     )
@@ -184,7 +204,9 @@ examples:
         dest="search_filters",
         help="Path to INI filter config file; runs each section as a grouped search",
     )
-    sr.add_argument("--product", help='Filter by product name (e.g. "Red Hat Satellite")')
+    sr.add_argument(
+        "--product", help='Filter by product name (e.g. "Red Hat Satellite")'
+    )
     sr.add_argument("--synopsis", help="Search terms for synopsis/content")
     sr.add_argument(
         "--after",
@@ -355,34 +377,19 @@ def _build_params(
 
 
 def _api_get(params: dict) -> dict | None:
-    """GET request with one retry on transient errors."""
-    for attempt in range(1 + MAX_RETRIES):
-        try:
-            resp = SESSION.get(API_URL, params=params, timeout=30)
+    """GET request with MAX_RETRIES on transient errors."""
+    try:
+        resp = SESSION.get(API_URL, params=params, timeout=TIMEOUT)
 
-            if resp.status_code == 200:
-                return resp.json()
+        if resp.status_code == 200:
+            return resp.json()
 
-            if resp.status_code >= 500 and attempt < MAX_RETRIES:
-                log.debug(
-                    "Server error %d, retrying in %ds...",
-                    resp.status_code, RETRY_DELAY,
-                )
-                time.sleep(RETRY_DELAY)
-                continue
+        log.warning("API returned HTTP %d", resp.status_code)
+        return None
 
-            log.warning("API returned HTTP %d", resp.status_code)
-            return None
-
-        except requests.RequestException as exc:
-            if attempt < MAX_RETRIES:
-                log.debug("Request failed (%s), retrying in %ds...", exc, RETRY_DELAY)
-                time.sleep(RETRY_DELAY)
-                continue
-            log.warning("Request failed: %s", exc)
-            return None
-
-    return None
+    except Exception as exc:
+        log.error(f"API request raised Exception {exc}")
+        return None
 
 
 def fetch_errata(
@@ -522,7 +529,11 @@ def _errata_row(doc: dict) -> dict:
         "id": errata_id,
         "synopsis": doc.get("portal_synopsis", "N/A"),
         "type": doc.get("portal_advisory_type", "N/A"),
-        "severity": doc.get("portal_severity", "None"),
+        "severity": (
+            doc.get("portal_severity", "N/A")
+            if doc.get("portal_advisory_type", "N/A") not in ("N/A", "Bug Fix Advisory")
+            else "N/A"
+        ),
         "date": (doc.get("portal_publication_date") or "N/A")[:10],
         "products": ", ".join(doc.get("portal_product_names", [])),
         "url": doc.get("view_uri", ERRATA_URL_TEMPLATE.format(errata_id=errata_id)),
@@ -595,7 +606,9 @@ def format_report_md(
         else:
             for doc in docs:
                 r = _errata_row(doc)
-                lines.append(f"  - [{r['id']} - {r['synopsis']}]({r['url']}) - {r['severity']}")
+                lines.append(
+                    f"  - [{r['id']} - {r['synopsis']}]({r['url']}) - {r['severity']}"
+                )
 
         lines.append("")
 
@@ -623,7 +636,9 @@ def format_report_flat_md(docs: list[dict], since_date: str = "") -> str:
     else:
         for doc in docs:
             r = _errata_row(doc)
-            lines.append(f"  - [{r['id']} - {r['synopsis']}]({r['url']}) - {r['severity']}")
+            lines.append(
+                f"  - [{r['id']} - {r['synopsis']}]({r['url']}) - {r['severity']}"
+            )
 
     lines.append("")
     lines.append(
@@ -671,7 +686,9 @@ def cmd_monitor(args: argparse.Namespace) -> None:
 
     _validate_products([filt.get("product", "") for filt in filters.values()])
 
-    log.debug("Querying errata published after %s for %d filter(s)", after_date, len(filters))
+    log.debug(
+        "Querying errata published after %s for %d filter(s)", after_date, len(filters)
+    )
 
     results: dict[str, list[dict]] = {}
     all_succeeded = True
@@ -719,8 +736,7 @@ def cmd_monitor(args: argparse.Namespace) -> None:
         state["last_run"] = datetime.now(timezone.utc).isoformat()
     else:
         log.warning(
-            "Some filters failed; last_run timestamp NOT updated. "
-            "Re-run to retry."
+            "Some filters failed; last_run timestamp NOT updated. " "Re-run to retry."
         )
 
     state["seen_errata"] = {name: sorted(ids) for name, ids in seen_errata.items()}
@@ -778,13 +794,15 @@ def cmd_search(args: argparse.Namespace) -> None:
     When --filters is *not* supplied, runs a single flat search using the
     CLI --product / --synopsis / etc. flags directly.
     """
-    after = getattr(args, "after", None) or ""
-    advisory_type = getattr(args, "advisory_type", None) or ""
-    severity = getattr(args, "severity", None) or ""
+    after = getattr(args, "after", "") or ""
+    advisory_type = getattr(args, "advisory_type", "") or ""
+    severity = getattr(args, "severity", "") or ""
     rows = getattr(args, "rows", 50)
 
     # --filters can come from the search subcommand or from the global parser
-    filters_path = getattr(args, "search_filters", None) or getattr(args, "filters", None)
+    filters_path = getattr(args, "search_filters", None) or getattr(
+        args, "filters", None
+    )
     use_filters = filters_path is not None
 
     if use_filters:
@@ -914,7 +932,9 @@ def _cmd_search_filters(
         print(f"Report written to {args.output}")
 
 
-def _reset_state(state_file: str, filter_names: list[str], reset_after: str | None) -> None:
+def _reset_state(
+    state_file: str, filter_names: list[str], reset_after: str | None
+) -> None:
     """Clear seen-errata state for given filters, optionally reset last_run."""
     state = load_state(state_file)
     seen = state.get("seen_errata", {})
