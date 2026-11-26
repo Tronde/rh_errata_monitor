@@ -24,6 +24,8 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 
 readonly API_URL="https://access.redhat.com/hydra/rest/search/kcs"
+readonly CVE_API_URL="https://access.redhat.com/hydra/rest/securitydata/cve.json"
+readonly CVE_PAGE_SIZE=1000
 readonly ERRATA_EXPLANATION_LINK='[Explaining Red Hat Errata (RHSA, RHBA, and RHEA)](https://access.redhat.com/articles/explaining_redhat_errata)'
 readonly USER_AGENT="rh-errata-monitor-bash/1.0"
 readonly ROWS_PER_PAGE=500
@@ -41,6 +43,9 @@ OUTPUT_FILE=""
 EXIT_CODE_MODE=false
 DRY_RUN=false
 VERBOSE=false
+CVSS_ENABLED=true
+declare -A CVSS_CACHE=()
+ENRICHED_DOCS="[]"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -98,6 +103,63 @@ api_get() {
     done
 
     return 1
+}
+
+fetch_cvss() {
+    local advisory_id="$1" page=1 total=0 scored=0 maximum=null
+    local unavailable='{"max_cvss3":null,"cvss3_status":"unavailable"}'
+    if [[ -z "$advisory_id" ]]; then
+        log_warn "Cannot look up CVSS scores: erratum has no advisory ID"
+        echo "$unavailable"
+        return
+    fi
+    while true; do
+        local body url count summary valid_count page_max
+        url="${CVE_API_URL}?advisory=$(urlencode "$advisory_id")&page=${page}&per_page=${CVE_PAGE_SIZE}&isCompressed=false"
+        if ! body=$(api_get "$url") || ! echo "$body" | jq -e 'type == "array" and all(.[]; type == "object")' >/dev/null 2>&1; then
+            log_warn "CVSS lookup failed for $advisory_id (page $page); score unavailable"
+            echo "$unavailable"
+            return
+        fi
+        count=$(echo "$body" | jq 'length')
+        summary=$(echo "$body" | jq '
+            [.[] | .cvss3_score |
+             (if type == "number" then . elif type == "string" then tonumber? else empty end) |
+             select(type == "number") | select(. >= 0 and . <= 10)] |
+            {count: length, maximum: max}')
+        valid_count=$(echo "$summary" | jq '.count')
+        page_max=$(echo "$summary" | jq '.maximum')
+        total=$((total + count))
+        scored=$((scored + valid_count))
+        maximum=$(jq -n --argjson a "$maximum" --argjson b "$page_max" '[$a, $b] | max')
+        [[ "$count" -lt "$CVE_PAGE_SIZE" ]] && break
+        page=$((page + 1))
+    done
+    local status=ok
+    if [[ "$total" -eq 0 ]]; then
+        status=no_cves
+    elif [[ "$scored" -eq 0 ]]; then
+        status=unavailable
+    elif [[ "$scored" -lt "$total" ]]; then
+        status=partial
+    fi
+    jq -n --argjson score "$maximum" --arg status "$status" '{max_cvss3:$score, cvss3_status:$status}'
+}
+
+enrich_errata() {
+    # Call in the parent shell: command substitution would discard the cache.
+    ENRICHED_DOCS="$1"
+    $CVSS_ENABLED || return 0
+    local advisory_id key metadata
+    while IFS= read -r advisory_id; do
+        key="id:$advisory_id"
+        if [[ -z "${CVSS_CACHE[$key]+present}" ]]; then
+            CVSS_CACHE["$key"]=$(fetch_cvss "$advisory_id")
+        fi
+        metadata="${CVSS_CACHE[$key]}"
+        ENRICHED_DOCS=$(echo "$ENRICHED_DOCS" | jq --arg id "$advisory_id" --argjson metadata "$metadata" \
+            'map(if (.id // "") == $id then . + {_cvss:$metadata} else . end)')
+    done < <(echo "$1" | jq -r 'map(.id // "") | unique | .[]')
 }
 
 urlencode() {
@@ -463,7 +525,7 @@ format_errata_json() {
             date: ((.portal_publication_date // "N/A") | .[:10]),
             products: ((.portal_product_names // []) | join(", ")),
             url: (.view_uri // "N/A")
-        }]'
+        } + (._cvss // {})]'
     else
         echo "$docs_json" | jq '[.[] | {
             id: .id,
@@ -473,17 +535,21 @@ format_errata_json() {
             date: ((.portal_publication_date // "N/A") | .[:10]),
             products: ((.portal_product_names // []) | join(", ")),
             url: (.view_uri // "N/A")
-        }]'
+        } + (._cvss // {})]'
     fi
 }
 
 format_errata_csv_header() {
     local with_filter="${1:-false}"
     if $with_filter; then
-        echo "filter,id,synopsis,type,severity,date,products,url"
+        printf '%s' "filter,id,synopsis,type,severity,date,products,url"
     else
-        echo "id,synopsis,type,severity,date,products,url"
+        printf '%s' "id,synopsis,type,severity,date,products,url"
     fi
+    if $CVSS_ENABLED; then
+        printf ',max_cvss3,cvss3_status'
+    fi
+    printf '\n'
 }
 
 format_errata_csv_rows() {
@@ -496,7 +562,7 @@ format_errata_csv_rows() {
              (.portal_severity // "None"),
              ((.portal_publication_date // "N/A") | .[:10]),
              ((.portal_product_names // []) | join(", ")),
-             (.view_uri // "N/A")]
+             (.view_uri // "N/A")] + (if has("_cvss") then [._cvss.max_cvss3, ._cvss.cvss3_status] else [] end)
             | @csv'
     else
         echo "$docs_json" | jq -r '.[] |
@@ -504,7 +570,7 @@ format_errata_csv_rows() {
              (.portal_severity // "None"),
              ((.portal_publication_date // "N/A") | .[:10]),
              ((.portal_product_names // []) | join(", ")),
-             (.view_uri // "N/A")]
+             (.view_uri // "N/A")] + (if has("_cvss") then [._cvss.max_cvss3, ._cvss.cvss3_status] else [] end)
             | @csv'
     fi
 }
@@ -516,7 +582,14 @@ format_errata_md() {
     local docs_json="$1"
 
     echo "$docs_json" | jq -r '
-        .[] | "  - [\(.id // "N/A") - \(.portal_synopsis // "N/A")](\(.view_uri // "N/A")) - \(.portal_severity // "None")"
+        def cvss_label:
+            if .cvss3_status == "no_cves" then "no associated CVEs"
+            elif .max_cvss3 == null then "unavailable"
+            else (.max_cvss3 | tostring | if contains(".") then . else . + ".0" end) +
+                 (if .cvss3_status == "partial" then " (partial)" else "" end)
+            end;
+        .[] | "  - [\(.id // "N/A") - \(.portal_synopsis // "N/A")](\(.view_uri // "N/A")) - \(.portal_severity // "None")" +
+        (if has("_cvss") then " - Max CVSS v3: " + (._cvss | cvss_label) else "" end)
     '
 }
 
@@ -634,6 +707,9 @@ cmd_monitor() {
         new_count=$(echo "$new_docs" | jq 'length')
         total_new=$((total_new + new_count))
         [[ "$new_count" -gt 0 ]] && filters_with_new=$((filters_with_new + 1))
+
+        enrich_errata "$new_docs"
+        new_docs="$ENRICHED_DOCS"
 
         # Format per filter
         case "$OUTPUT_FORMAT" in
@@ -894,6 +970,8 @@ _cmd_search_flat() {
         fi
     fi
 
+    enrich_errata "$docs"
+    docs="$ENRICHED_DOCS"
     local doc_count
     doc_count=$(echo "$docs" | jq 'length')
 
@@ -998,6 +1076,8 @@ _cmd_search_filters() {
             docs="[]"
         fi
 
+        enrich_errata "$docs"
+        docs="$ENRICHED_DOCS"
         local doc_count
         doc_count=$(echo "$docs" | jq 'length')
         total=$((total + doc_count))
@@ -1139,6 +1219,7 @@ Global flags:
   --initial-days N     Lookback days on first run (default: 30)
   --format FORMAT      Output: json, csv, md (default: md)
   --output FILE        Write report to file
+  --no-cvss            Skip CVE score lookups and omit CVSS report fields
   --exit-code          Exit 2 when new errata found
   --dry-run            Show queries without hitting API
   -v, --verbose        Debug logging
@@ -1180,6 +1261,7 @@ main() {
             --initial-days)  shift; INITIAL_DAYS="${1:-30}"; shift ;;
             --format)        shift; OUTPUT_FORMAT="${1:-md}"; shift ;;
             --output)        shift; OUTPUT_FILE="${1:-}"; shift ;;
+            --no-cvss)       CVSS_ENABLED=false; shift ;;
             --exit-code)     EXIT_CODE_MODE=true; shift ;;
             --dry-run)       DRY_RUN=true; shift ;;
             -v|--verbose)    VERBOSE=true; shift ;;

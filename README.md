@@ -137,12 +137,12 @@ The default format is `md` (Markdown), which is convenient for pasting into wiki
 ```markdown
 ### satellite-releases (2 new errata since 2026-08-20)
 
-  - [RHBA-2026:51087 - Satellite 6 Client Bug Fix Update](https://access.redhat.com/errata/RHBA-2026:51087) - None
-  - [RHSA-2024:2010 - Important: Satellite 6.15.0 release](https://access.redhat.com/errata/RHSA-2024:2010) - Important
+  - [RHBA-2026:51087 - Satellite 6 Client Bug Fix Update](https://access.redhat.com/errata/RHBA-2026:51087) - None - Max CVSS v3: unavailable
+  - [RHSA-2024:2010 - Important: Satellite 6.15.0 release](https://access.redhat.com/errata/RHSA-2024:2010) - Important - Max CVSS v3: unavailable
 
 ### aap-setup-bundle (1 new erratum since 2026-08-20)
 
-  - [RHBA-2026:67611 - Red Hat Ansible Automation Platform 2.7 Setup Bundle Release Update](https://access.redhat.com/errata/RHBA-2026:67611) - None
+  - [RHBA-2026:67611 - Red Hat Ansible Automation Platform 2.7 Setup Bundle Release Update](https://access.redhat.com/errata/RHBA-2026:67611) - None - Max CVSS v3: unavailable
 
 **Total: 3 new errata since 2026-08-20 across 2 filters**
 
@@ -150,6 +150,10 @@ The default format is `md` (Markdown), which is convenient for pasting into wiki
 ```
 
 The `since DATE` suffix always appears for `monitor` (it always queries from a known date) and only appears for `search` when `--after` was explicitly passed. Filters with no results render as a single `  - none` line.
+
+The example illustrates unavailable scores. When scores are available, each
+erratum instead shows a value such as `Max CVSS v3: 7.5`. See
+[CVE scores](#cve-scores) for scoring and failure behavior.
 
 ## Filter configuration
 
@@ -196,6 +200,7 @@ Both tools share the same interface.
 | `--state-file FILE` | Path to JSON state file | `.errata_state.json` |
 | `--initial-days N` | On first run, look back N days | `30` |
 | `--format {json,csv,md}` | Output format | `md` |
+| `--no-cvss` | Skip CVE score lookups and omit CVSS report fields | _(off; scores enabled)_ |
 | `--output FILE` | Write report to file in addition to stdout | _(none)_ |
 | `--exit-code` | Exit with code 2 when new errata are found | _(off)_ |
 | `--dry-run` | Show queries without hitting the API | _(off)_ |
@@ -257,7 +262,50 @@ python3 rh_errata_monitor.py --exit-code monitor
 
 # Dry run -- preview queries
 ./rh_errata_monitor.sh --dry-run monitor
+
+# Skip CVE lookups and use the original report fields
+python3 rh_errata_monitor.py --no-cvss monitor
+./rh_errata_monitor.sh --no-cvss search --product "Red Hat Satellite"
 ```
+
+## CVE scores
+
+Both tools enrich `monitor` and `search` reports by default with the highest
+available **Red Hat CVSS v3 base score** among the CVEs associated with each
+advisory. Scores come from the
+[Red Hat Security Data CVE API](https://docs.redhat.com/en/documentation/red_hat_security_data_api/1.0/security_data_api-cve),
+using its advisory filter and all result pages. These scores describe associated
+CVEs; they are separate from Red Hat's advisory severity and are not a
+product-specific risk assessment. CVSS v2 scores are not used as a fallback.
+All advisory types are checked, including RHBA and RHEA.
+
+Markdown adds `Max CVSS v3: 7.5` to an erratum's bullet. If only some associated
+CVEs have valid scores, it shows the highest available value with `(partial)`.
+JSON and CSV append `max_cvss3` and `cvss3_status` fields:
+
+- `ok`: all returned CVEs have valid scores; `max_cvss3` is their maximum.
+- `partial`: some scores are missing or invalid; the maximum covers only the
+  valid scores and may be lower than the true maximum.
+- `no_cves`: a successful lookup returned no associated CVEs. Markdown shows
+  `no associated CVEs`.
+- `unavailable`: no valid scores were returned, or the lookup failed. Markdown
+  shows `unavailable`. A failed result page invalidates the entire lookup.
+
+Missing maximum scores are JSON `null` or empty CSV cells, never a substitute
+zero. A valid score of `0.0` is retained.
+
+Enrichment requires an extra request per unique reported advisory, plus requests
+for additional pages. Results, including failures, are reused across filters
+within a run; they are not cached between runs. Monitor lookups happen only for
+new errata. `--dry-run` makes no requests, and `list-products` is unchanged.
+Use global `--no-cvss` before the command to skip these lookups and retain the
+original Markdown, JSON, and CSV report fields.
+
+Lookup failures produce warnings without stopping the report or changing normal
+monitor state updates and exit codes. Consequently, a missing score does not
+cause an erratum to be reported again. Use a subsequent stateless `search` to
+retrieve scores that were previously unavailable. Reports saved with `--output`
+contain the same score information as the report printed to stdout.
 
 ## State file
 
@@ -343,6 +391,10 @@ sudo systemctl enable --now errata-monitor.timer
 4. Filters out errata already reported in prior runs (deduplication by errata ID).
 5. Prints the report in the requested format.
 6. Updates the state file (timestamp advances only if all filter queries succeeded).
+
+Before formatting, both tools look up CVSS v3 scores for the reported errata
+unless `--no-cvss` is set. Failures of this optional enrichment do not prevent
+the state timestamp from advancing.
 
 ## API reference
 

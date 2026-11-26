@@ -24,6 +24,7 @@ import csv
 import io
 import json
 import logging
+import math
 import sys
 import time
 import os
@@ -40,6 +41,8 @@ from urllib3.util.retry import Retry
 # ---------------------------------------------------------------------------
 
 API_URL = "https://access.redhat.com/hydra/rest/search/kcs"
+CVE_API_URL = "https://access.redhat.com/hydra/rest/securitydata/cve.json"
+CVE_PAGE_SIZE = 1000
 ERRATA_URL_TEMPLATE = "https://access.redhat.com/errata/{errata_id}"
 ERRATA_EXPLANATION_LINK = (
     "[Explaining Red Hat Errata (RHSA, RHBA, and RHEA)]"
@@ -142,6 +145,11 @@ examples:
         default="md",
         dest="output_format",
         help="Output format (default: md)",
+    )
+    parser.add_argument(
+        "--no-cvss",
+        action="store_true",
+        help="Skip CVE score lookups and omit CVSS fields from reports",
     )
     parser.add_argument(
         "--output",
@@ -522,6 +530,84 @@ def _validate_products(products: list[str]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# CVE scores
+# ---------------------------------------------------------------------------
+
+
+def fetch_cvss(advisory_id: str) -> dict:
+    """Return the highest available Red Hat CVSS v3 base score for an advisory.
+
+    A failed page invalidates the entire lookup, so a truncated result cannot
+    be mistaken for the advisory maximum.
+    """
+    unavailable = {"max_cvss3": None, "cvss3_status": "unavailable"}
+    if not advisory_id:
+        log.warning("Cannot look up CVSS scores: erratum has no advisory ID")
+        return unavailable
+
+    scores: list[float] = []
+    total = 0
+    page = 1
+    try:
+        while True:
+            response = SESSION.get(
+                CVE_API_URL,
+                params={"advisory": advisory_id, "page": page, "per_page": CVE_PAGE_SIZE},
+                timeout=TIMEOUT,
+            )
+            response.raise_for_status()
+            records = response.json()
+            if not isinstance(records, list) or any(not isinstance(r, dict) for r in records):
+                raise ValueError("expected an array of CVE objects")
+            total += len(records)
+            for record in records:
+                value = record.get("cvss3_score")
+                if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+                    continue
+                try:
+                    score = float(value)
+                except (ValueError, OverflowError):
+                    continue
+                if math.isfinite(score) and 0 <= score <= 10:
+                    scores.append(score)
+            if len(records) < CVE_PAGE_SIZE:
+                break
+            page += 1
+    except (requests.RequestException, ValueError) as exc:
+        log.warning("CVSS lookup failed for %s: %s", advisory_id, exc)
+        return unavailable
+
+    if not total:
+        return {"max_cvss3": None, "cvss3_status": "no_cves"}
+    return {
+        "max_cvss3": max(scores) if scores else None,
+        "cvss3_status": ("ok" if len(scores) == total else "partial") if scores else "unavailable",
+    }
+
+
+def enrich_errata(docs: list[dict], cache: dict[str, dict]) -> None:
+    """Attach score metadata, sharing successes and failures across filters."""
+    for doc in docs:
+        advisory_id = doc.get("id") or ""
+        if advisory_id not in cache:
+            cache[advisory_id] = fetch_cvss(advisory_id)
+        doc["_cvss"] = cache[advisory_id]
+
+
+def _cvss_md(row: dict) -> str:
+    if "cvss3_status" not in row:
+        return ""
+    score = row["max_cvss3"]
+    if score is None:
+        label = "no associated CVEs" if row["cvss3_status"] == "no_cves" else "unavailable"
+    else:
+        label = f"{score:.1f}"
+        if row["cvss3_status"] == "partial":
+            label += " (partial)"
+    return f" - Max CVSS v3: {label}"
+
+
+# ---------------------------------------------------------------------------
 # Formatters
 # ---------------------------------------------------------------------------
 
@@ -529,7 +615,7 @@ def _validate_products(products: list[str]) -> None:
 def _errata_row(doc: dict) -> dict:
     """Normalize an errata doc into a flat row dict."""
     errata_id = doc.get("id", "N/A")
-    return {
+    row = {
         "id": errata_id,
         "synopsis": doc.get("portal_synopsis", "N/A"),
         "type": doc.get("portal_advisory_type", "N/A"),
@@ -542,6 +628,8 @@ def _errata_row(doc: dict) -> dict:
         "products": ", ".join(doc.get("portal_product_names", [])),
         "url": doc.get("view_uri", ERRATA_URL_TEMPLATE.format(errata_id=errata_id)),
     }
+    row.update(doc.get("_cvss", {}))
+    return row
 
 
 def format_json(results: dict[str, list[dict]] | list[dict]) -> str:
@@ -557,12 +645,14 @@ def format_json(results: dict[str, list[dict]] | list[dict]) -> str:
     return json.dumps(rows, indent=2)
 
 
-def format_csv(results: dict[str, list[dict]] | list[dict]) -> str:
+def format_csv(results: dict[str, list[dict]] | list[dict], include_cvss: bool = False) -> str:
     buf = io.StringIO()
     is_grouped = isinstance(results, dict)
     fieldnames = ["id", "synopsis", "type", "severity", "date", "products", "url"]
     if is_grouped:
         fieldnames.insert(0, "filter")
+    if include_cvss:
+        fieldnames.extend(["max_cvss3", "cvss3_status"])
 
     writer = csv.DictWriter(buf, fieldnames=fieldnames, lineterminator="\n")
     writer.writeheader()
@@ -612,6 +702,7 @@ def format_report_md(
                 r = _errata_row(doc)
                 lines.append(
                     f"  - [{r['id']} - {r['synopsis']}]({r['url']}) - {r['severity']}"
+                    + _cvss_md(r)
                 )
 
         lines.append("")
@@ -643,6 +734,7 @@ def format_report_flat_md(docs: list[dict], since_date: str = "") -> str:
             r = _errata_row(doc)
             lines.append(
                 f"  - [{r['id']} - {r['synopsis']}]({r['url']}) - {r['severity']}"
+                + _cvss_md(r)
             )
 
     lines.append("")
@@ -724,10 +816,13 @@ def cmd_monitor(args: argparse.Namespace) -> None:
         if i < len(filters) - 1:
             time.sleep(REQUEST_DELAY)
 
+    if not args.no_cvss:
+        enrich_errata([doc for docs in results.values() for doc in docs], {})
+
     # Format output
     formatters = {
         "json": format_json,
-        "csv": format_csv,
+        "csv": lambda r: format_csv(r, include_cvss=not args.no_cvss),
         "md": lambda r: format_report_md(r, since_date=after_date, new=True),
     }
     report = formatters[args.output_format](results)
@@ -861,9 +956,12 @@ def _cmd_search_flat(
         print("Error: API request failed.")
         sys.exit(1)
 
+    if not args.no_cvss:
+        enrich_errata(docs, {})
+
     formatters_flat = {
         "json": lambda d: format_json(d),
-        "csv": lambda d: format_csv(d),
+        "csv": lambda d: format_csv(d, include_cvss=not args.no_cvss),
         "md": lambda d: format_report_flat_md(d, since_date=after),
     }
     report = formatters_flat[args.output_format](docs)
@@ -925,9 +1023,12 @@ def _cmd_search_filters(
         if i < len(filters) - 1:
             time.sleep(REQUEST_DELAY)
 
+    if not args.no_cvss:
+        enrich_errata([doc for docs in results.values() for doc in docs], {})
+
     formatters = {
         "json": format_json,
-        "csv": format_csv,
+        "csv": lambda r: format_csv(r, include_cvss=not args.no_cvss),
         "md": lambda r: format_report_md(r, since_date=after, new=False),
     }
     report = formatters[args.output_format](results)
