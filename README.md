@@ -44,6 +44,62 @@ pip install -r requirements.txt  # Python version only
 cp filters.conf.example filters.conf
 ```
 
+## Running in containers
+
+Both versions include a Containerfile. With Podman installed, build the images
+from the repository root (the final `.` supplies the build context):
+
+```bash
+# Python version
+podman build -f Containerfile-python -t localhost/rh_errata_monitor:python .
+
+# Bash version
+podman build -f Containerfile-shell -t localhost/rh_errata_monitor:shell .
+```
+
+The images include the script and its dependencies, but require your filter
+configuration at runtime. Prepare a dedicated directory for configuration and
+persistent state:
+
+```bash
+mkdir -p container-data
+cp filters.conf.example container-data/filters.conf
+# Edit container-data/filters.conf to match your products and synopsis filters.
+```
+
+Run either image with rootless Podman (without `sudo`):
+
+```bash
+# Python version
+podman run --rm --userns=keep-id:uid=65534,gid=65534 \
+  -v "$(pwd)/container-data:/app:Z" \
+  localhost/rh_errata_monitor:python \
+  --filters /app/filters.conf --state-file /app/.errata_state.json monitor
+
+# Bash version
+podman run --rm --userns=keep-id:uid=65534,gid=65534 \
+  -v "$(pwd)/container-data:/app:Z" \
+  localhost/rh_errata_monitor:shell \
+  --filters /app/filters.conf --state-file /app/.errata_state.json monitor
+```
+
+Both images use `/app` as their working directory and run as UID 65534. The
+`--userns=keep-id:uid=65534,gid=65534` option maps your host user to that container
+user so the monitor can write to the mounted directory. See the
+[Podman user namespace documentation](https://docs.podman.io/en/latest/markdown/podman-run.1.html#userns-mode).
+The `:Z` suffix relabels the directory for container access on SELinux systems.
+
+Configuration and `.errata_state.json` remain in `container-data` after `--rm`
+removes the container. Reuse this directory on subsequent runs to retain the
+last-run timestamp and previously reported errata. To continue from an existing
+installation, copy its `filters.conf` and `.errata_state.json` into this directory
+before the first container run.
+
+Each image starts its monitor script directly. Put global options before the
+command, as shown above; replace `monitor` with `list-products` or `search` to use
+those commands. To save a report on the host, add `--output /app/report.md` before
+`monitor`; it will appear as `container-data/report.md`.
+
 ## Quick start
 
 1. Copy and edit the filter configuration:
