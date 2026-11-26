@@ -24,6 +24,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 
 readonly API_URL="https://access.redhat.com/hydra/rest/search/kcs"
+readonly ERRATA_EXPLANATION_LINK='[Explaining Red Hat Errata (RHSA, RHBA, and RHEA)](https://access.redhat.com/articles/explaining_redhat_errata)'
 readonly USER_AGENT="rh-errata-monitor-bash/1.0"
 readonly ROWS_PER_PAGE=500
 readonly MAX_RETRIES=1
@@ -698,6 +699,7 @@ cmd_monitor() {
             output+=" since ${after_date} across ${filters_with_new} filter"
             [[ "$filters_with_new" -ne 1 ]] && output+="s"
             output+="**"
+            output+=$'\n\n'"$ERRATA_EXPLANATION_LINK"
             echo "$output"
             ;;
     esac
@@ -915,6 +917,7 @@ _cmd_search_flat() {
             echo -n "**Total: ${doc_count} errat$([ "$doc_count" -eq 1 ] && echo "um" || echo "a")"
             [[ -n "$after" ]] && echo -n " since ${after}"
             echo "**"
+            printf '\n%s\n' "$ERRATA_EXPLANATION_LINK"
             ;;
     esac
 
@@ -940,6 +943,7 @@ _cmd_search_flat() {
                     else
                         echo "**Total: ${doc_count} errat$([ "$doc_count" -eq 1 ] && echo "um" || echo "a")**"
                     fi
+                    printf '\n%s\n' "$ERRATA_EXPLANATION_LINK"
                 } > "$OUTPUT_FILE"
                 ;;
         esac
@@ -1054,6 +1058,7 @@ _cmd_search_filters() {
             output+=" across ${filters_with_results} filter"
             [[ "$filters_with_results" -ne 1 ]] && output+="s"
             output+="**"
+            output+=$'\n\n'"$ERRATA_EXPLANATION_LINK"
             echo "$output"
             ;;
     esac

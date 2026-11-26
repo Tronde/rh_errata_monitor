@@ -89,6 +89,8 @@ The default format is `md` (Markdown), which is convenient for pasting into wiki
   - [RHBA-2026:67611 - Red Hat Ansible Automation Platform 2.7 Setup Bundle Release Update](https://access.redhat.com/errata/RHBA-2026:67611) - None
 
 **Total: 3 new errata since 2026-08-20 across 2 filters**
+
+[Explaining Red Hat Errata (RHSA, RHBA, and RHEA)](https://access.redhat.com/articles/explaining_redhat_errata)
 ```
 
 The `since DATE` suffix always appears for `monitor` (it always queries from a known date) and only appears for `search` when `--after` was explicitly passed. Filters with no results render as a single `  - none` line.

@@ -41,6 +41,10 @@ from urllib3.util.retry import Retry
 
 API_URL = "https://access.redhat.com/hydra/rest/search/kcs"
 ERRATA_URL_TEMPLATE = "https://access.redhat.com/errata/{errata_id}"
+ERRATA_EXPLANATION_LINK = (
+    "[Explaining Red Hat Errata (RHSA, RHBA, and RHEA)]"
+    "(https://access.redhat.com/articles/explaining_redhat_errata)"
+)
 ROWS_PER_PAGE = 500
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", 1))
 TIMEOUT = int(os.environ.get("TIMEOUT", 15))
@@ -618,6 +622,7 @@ def format_report_md(
         f"**Total: {total} {label}{total_unit}{since_suffix} "
         f"across {filter_count} filter{'s' if filter_count != 1 else ''}**"
     )
+    lines.extend(["", ERRATA_EXPLANATION_LINK])
     return "\n".join(lines)
 
 
@@ -644,6 +649,7 @@ def format_report_flat_md(docs: list[dict], since_date: str = "") -> str:
     lines.append(
         f"**Total: {len(docs)} errat{'um' if len(docs) == 1 else 'a'}{since_suffix}**"
     )
+    lines.extend(["", ERRATA_EXPLANATION_LINK])
     return "\n".join(lines)
 
 
